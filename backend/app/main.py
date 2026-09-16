@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, Response
 from pypdf import PdfReader
 import httpx
 from dotenv import load_dotenv
+from json_repair import repair_json
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
@@ -29,6 +30,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI(title="Quiz Question Bank Generator API")
 logger = logging.getLogger(__name__)
+question_bank: list[dict[str, Any]] = []
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +39,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def parse_ollama_json(content: str) -> dict[str, Any] | None:
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            result = json.loads(repair_json(content))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    return result if isinstance(result, dict) else None
 
 
 def normalize_text(raw_text: str) -> str:
@@ -272,50 +285,6 @@ def generate_questions(text: str, difficulty: str = "Medium", question_type: str
     return questions
 
 
-def save_questions(questions: list[dict[str, str]]) -> None:
-    conn: sqlite3.Connection = get_connection()
-    try:
-        conn.executemany(
-            "INSERT INTO questions (text, answer, difficulty, topic) VALUES (?, ?, ?, ?)",
-            [
-                (question["question"], question["answer"], question["difficulty"], question["topic"])
-                for question in questions
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def get_cached_questions(cache_key: str) -> list[dict[str, Any]] | None:
-    conn = get_connection()
-    try:
-        row = conn.execute(
-            "SELECT questions_json FROM generation_cache WHERE cache_key = ?",
-            (cache_key,),
-        ).fetchone()
-        if not row:
-            return None
-        cached = json.loads(row["questions_json"])
-        return cached if isinstance(cached, list) else None
-    except json.JSONDecodeError:
-        return None
-    finally:
-        conn.close()
-
-
-def cache_questions(cache_key: str, questions: list[dict[str, Any]]) -> None:
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO generation_cache (cache_key, questions_json) VALUES (?, ?)",
-            (cache_key, json.dumps(questions)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def get_document(document_id: str) -> dict[str, str] | None:
     init_db()
     conn = get_connection()
@@ -377,8 +346,6 @@ QUESTION_RESPONSE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string"},
-                    "answer": {"type": "string"},
-                    "source_answer": {"type": "string"},
                     "topic": {"type": "string"},
                     "unit": {"type": "string"},
                     "format": {"type": "string", "enum": ["quiz", "fill_blank", "mcq"]},
@@ -386,7 +353,7 @@ QUESTION_RESPONSE_SCHEMA = {
                     "marks": {"type": "integer"},
                     "options": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["question", "answer", "source_answer", "topic", "unit", "format", "section", "marks", "options"],
+                "required": ["question", "topic", "unit", "format", "section", "marks"],
                 "additionalProperties": False,
             },
         },
@@ -402,42 +369,35 @@ def call_ollama(
     max_tokens: int,
     response_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/chat").strip().rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:1b").strip()
+    endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate").strip().rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:latest").strip()
     timeout = float(os.getenv("OLLAMA_TIMEOUT", "1020"))
-    native_ollama = endpoint.endswith("/api/chat")
+    native_ollama = endpoint.endswith("/api/generate")
     try:
-        attempts = [(temperature, max_tokens, 1.15, 128)]
-        if native_ollama:
-            attempts.append((max(temperature, 0.4), max_tokens, 1.25, 256))
-
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0), trust_env=False) as client:
-            for attempt_temperature, attempt_max_tokens, repeat_penalty, repeat_last_n in attempts:
-                request_body = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                if native_ollama:
-                    request_body.update({
-                        "stream": False,
-                        "format": response_schema or "json",
-                        "options": {
-                            "temperature": attempt_temperature,
-                            "num_predict": attempt_max_tokens,
-                            "repeat_penalty": repeat_penalty,
-                            "repeat_last_n": repeat_last_n,
-                        },
-                    })
-                else:
-                    request_body.update({"temperature": attempt_temperature, "max_tokens": attempt_max_tokens, "response_format": {"type": "json_object"}})
+            request_body = {
+                "model": model,
+                "prompt": prompt,
+            }
+            if native_ollama:
+                request_body.update({
+                    "stream": False,
+                    "format": response_schema or "json",
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens,
+                        "repeat_penalty": 1.15,
+                        "repeat_last_n": 128,
+                    },
+                })
+            else:
+                request_body.update({"temperature": temperature, "max_tokens": max_tokens, "response_format": {"type": "json_object"}})
 
-                response = client.post(
-                    endpoint,
-                    headers={"Authorization": "Bearer ollama", "Content-Type": "application/json"},
-                    json=request_body,
-                )
-                if response.status_code != 500 or "repeat limit" not in response.text.lower() or attempt_max_tokens == attempts[-1][1]:
-                    break
+            response = client.post(
+                endpoint,
+                headers={"Authorization": "Bearer ollama", "Content-Type": "application/json"},
+                json=request_body,
+            )
         if response.is_error:
             logger.error(
                 "Ollama returned HTTP %s from %s: %s",
@@ -450,13 +410,12 @@ def call_ollama(
         if response_body.get("error"):
             logger.error("Ollama prediction failed: %s", response_body["error"])
             return None
-        content = response_body["message"]["content"] if native_ollama else response_body["choices"][0]["message"]["content"]
+        content = response_body["response"] if native_ollama else response_body["choices"][0]["message"]["content"]
         if not isinstance(content, str):
             return None
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
-        result = json.loads(content)
-        return result if isinstance(result, dict) else None
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return parse_ollama_json(content)
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
         logger.exception("Ollama request failed: %s", exc)
         return None
 
@@ -477,38 +436,89 @@ Document:
     return context.strip() if isinstance(context, str) and context.strip() else None
 
 
+def build_question_generation_prompt(text: str, difficulty: str, question_type: str) -> str:
+    """Create a compact prompt tuned to the selected question generation mode."""
+    base_rules = [
+        "You are an academic question generator. Use ONLY the supplied study material.",
+        "Do not use outside knowledge. Do not invent facts. Keep every question grounded in the source.",
+        "Do not mention course titles, unit titles, or generic phrases such as 'Theory in General'.",
+        "Keep each question under 220 characters.",
+        "Return concise JSON without markdown or extra explanation.",
+        "Difficulty: " + difficulty,
+        "Requested format: " + question_type,
+        "Return ONLY valid JSON in this exact shape:",
+        '{"questions": [{"question": "...", "topic": "...", "unit": "...", "format": "quiz|fill_blank|mcq", "section": "...", "marks": 1, "options": []}]}',
+    ]
+
+    if question_type == "quiz":
+        dynamic_rules = [
+            "Create exactly 5 quiz questions.",
+            "Use a direct short-answer style question with no answer key in the output.",
+            "Each question must be clear, factual, and answerable from the material.",
+        ]
+    elif question_type == "fill_blank":
+        dynamic_rules = [
+            "Create exactly 5 fill-in-the-blank questions.",
+            "Include one blank and do not provide the missing phrase separately.",
+            "Do not include answer keys or explanations.",
+            "Keep the sentence grammatically correct after the blank is inserted.",
+        ]
+    elif question_type == "mcq":
+        dynamic_rules = [
+            "Create exactly 5 MCQ questions.",
+            "Provide 2 to 4 options in the options array and do not reveal the correct answer.",
+            "Use plausible distractors grounded in the study material.",
+            "The format field must be 'mcq'.",
+        ]
+    elif question_type == "mid_pattern":
+        dynamic_rules = [
+            "Create up to 10 questions total.",
+            "Use Section A for the first 5 questions (1 mark each) and Section B for the remaining questions (5 marks each).",
+            "Format should be quiz-style questions, without MCQ or fill_blank variants.",
+            "Keep the mix balanced between brief factual recall and short explanations.",
+        ]
+    elif question_type == "sem_pattern":
+        dynamic_rules = [
+            "Create up to 10 questions total.",
+            "Use Section A for the first 5 questions (2 marks each) and Section B for the remaining questions (8 marks each).",
+            "Format should be quiz-style questions, without MCQ or fill_blank variants.",
+            "Prefer deeper conceptual questions in Section B.",
+        ]
+    elif question_type == "all_mix":
+        dynamic_rules = [
+            "Create up to 10 questions total.",
+            "Mix quiz, fill_blank, and mcq formats across the set.",
+            "Use a natural blend and ensure no single type dominates the entire set.",
+            "For odd positions, use Mid Section A style with 1 mark; for even positions, use Sem Section B style with 8 marks.",
+            "The overall output should contain a range of question styles, not only one type.",
+        ]
+    else:
+        dynamic_rules = ["Create a valid set of grounded questions matching the requested format."]
+
+    prompt = "\n".join(base_rules + dynamic_rules + ["Study material:", text])
+    return prompt
+
+
+def normalize_question_format(question_type: str, item: dict[str, Any]) -> str:
+    """Ensure each returned item follows the selected generation mode."""
+    if question_type in {"quiz", "fill_blank", "mcq"}:
+        return question_type
+    if question_type in {"mid_pattern", "sem_pattern"}:
+        return "quiz"
+    if question_type == "all_mix":
+        current_format = item.get("format")
+        return current_format if current_format in {"quiz", "fill_blank", "mcq"} else "quiz"
+    return "quiz"
+
+
 def generate_questions_with_ollama(text: str, difficulty: str, question_type: str) -> list[dict[str, Any]] | None:
     """Ask Ollama for grounded questions; return None when the service fails."""
-    prompt = f"""
-You are an academic question generator. Use ONLY the supplied study material.
-Do not use outside knowledge. Do not invent facts. Keep answers grounded in the source.
-Difficulty: {difficulty}
-Requested format: {question_type}
-
-Return ONLY valid JSON in this exact shape:
-{{"questions": [{{"question": "...", "answer": "...", "source_answer": "...", "topic": "...", "unit": "...", "format": "quiz|fill_blank|mcq", "section": "...", "marks": 1, "options": []}}]}}
-
-Rules:
-- Create 5 questions for quiz, fill_blank, or mcq.
-- Create up to 10 questions for mid_pattern, sem_pattern, or all_mix.
-- For all_mix, combine quiz, fill_blank, and mcq formats.
-- For fill_blank, include one blank and put the missing source phrase in answer.
-- For mcq, include 2 to 4 options and make answer exactly one option.
-- For mid_pattern use Section A (1 mark) and Section B (5 marks).
-- For sem_pattern use Section A (2 marks) and Section B (8 marks).
-- For all_mix, use a mixture of those section styles.
-- Do not mention course titles, unit titles, or generic phrases such as 'Theory in General'.
-- Keep each question under 220 characters and each answer under 180 characters.
-- Return concise JSON without markdown or extra explanation.
-
-Study material:
-{text}
-"""
+    prompt = build_question_generation_prompt(text, difficulty, question_type)
 
     result = call_ollama(
         prompt,
         temperature=0.2,
-        max_tokens=8192,
+        max_tokens=1200,
         response_schema=QUESTION_RESPONSE_SCHEMA,
     )
     generated = result.get("questions") if result else None
@@ -517,32 +527,54 @@ Study material:
 
     questions = []
     for index, item in enumerate(generated, start=1):
-        if not isinstance(item, dict) or not item.get("question") or not item.get("answer"):
+        if not isinstance(item, dict) or not item.get("question"):
             continue
+
         item["id"] = index
         item["difficulty"] = difficulty
         item["question_type"] = question_type
-        item.setdefault("source_answer", item["answer"])
         item.setdefault("topic", "Study material")
         item.setdefault("unit", "General")
-        item.setdefault("format", question_type if question_type in {"quiz", "fill_blank", "mcq"} else "quiz")
         item.setdefault("section", "General")
         item.setdefault("marks", 2)
-        if item.get("format") != "mcq":
+
+        item["format"] = normalize_question_format(question_type, item)
+
+        if question_type in {"quiz", "fill_blank", "mid_pattern", "sem_pattern"}:
             item.pop("options", None)
+        elif question_type == "mcq":
+            options = item.get("options")
+            if not isinstance(options, list) or len(options) < 2:
+                item["options"] = [item["question"], item["question"], item["question"]]
+        elif question_type == "all_mix":
+            if item.get("format") != "mcq":
+                item.pop("options", None)
+
         questions.append(item)
-    return questions or None
+
+    if not questions:
+        return None
+
+    if question_type in {"quiz", "fill_blank", "mcq"}:
+        if any(item.get("format") != question_type for item in questions):
+            return None
+    elif question_type in {"mid_pattern", "sem_pattern"}:
+        if any(item.get("format") != "quiz" for item in questions):
+            return None
+
+    return questions
 
 
 def fetch_questions() -> list[dict[str, Any]]:
-    conn: sqlite3.Connection = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT id, text, answer, difficulty, topic, created_at FROM questions ORDER BY created_at DESC, id DESC"
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
+    return [
+        {
+            "id": question.get("id"),
+            "text": question.get("question", ""),
+            "difficulty": question.get("difficulty", ""),
+            "topic": question.get("topic", ""),
+        }
+        for question in reversed(question_bank)
+    ]
 
 
 @app.on_event("startup")
@@ -570,14 +602,13 @@ def export_questions(format: str = "json") -> Response:
 
     if format == "csv":
         output = io.StringIO()
-        fieldnames = ["id", "question", "answer", "difficulty", "topic", "created_at"]
+        fieldnames = ["id", "question", "difficulty", "topic", "created_at"]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for question in questions:
             writer.writerow({
                 "id": question.get("id", ""),
                 "question": question.get("text", ""),
-                "answer": question.get("answer", ""),
                 "difficulty": question.get("difficulty", ""),
                 "topic": question.get("topic", ""),
                 "created_at": question.get("created_at", ""),
@@ -612,7 +643,6 @@ def export_questions(format: str = "json") -> Response:
             story.append(Paragraph(metadata, styles["Heading3"]))
             story.append(Paragraph(escape(str(question.get("text", ""))), styles["BodyText"]))
             story.append(Spacer(1, 0.08 * inch))
-            story.append(Paragraph(f"<b>Answer:</b> {escape(str(question.get('answer', '')))}", styles["BodyText"]))
             story.append(Spacer(1, 0.18 * inch))
 
         document.build(story)
@@ -653,19 +683,6 @@ async def generate_question_bank(
     else:
         raise HTTPException(status_code=400, detail="Upload a document or provide a stored filename.")
 
-    model = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
-    cache_key = hashlib.sha256(
-        b"|".join((document_id.encode(), difficulty.encode(), question_type.encode(), model.encode()))
-    ).hexdigest()
-    cached_questions = get_cached_questions(cache_key)
-    if cached_questions:
-        return {
-            "questions": cached_questions,
-            "count": len(cached_questions),
-            "cached": True,
-            "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),
-        }
-
     context = document.get("ollama_context")
     if not context:
         context = compress_document_context(text)
@@ -678,11 +695,14 @@ async def generate_question_bank(
             status_code=503,
             detail="Ollama generation failed or is unavailable. Start Ollama, pull the selected model, and try again.",
         )
-    save_questions(questions)
-    cache_questions(cache_key, questions)
+    public_questions = [
+        {key: value for key, value in question.items() if key not in {"answer", "source_answer"}}
+        for question in questions
+    ]
+    question_bank.extend(public_questions)
     return {
-        "questions": questions,
-        "count": len(questions),
+        "questions": public_questions,
+        "count": len(public_questions),
         "cached": False,
         "context_cached": bool(context),
         "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),

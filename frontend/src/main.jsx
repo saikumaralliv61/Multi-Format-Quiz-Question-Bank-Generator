@@ -161,8 +161,6 @@ function App() {
                   <p className="meta">{item.unit || 'General'} • {item.section || 'General'} • {item.marks || 0} marks • {item.format || item.question_type} • {item.topic} • {item.difficulty}</p>
                   <h3>{item.question}</h3>
                   {item.options && <ol className="options-list">{item.options.map((option) => <li key={option}>{option}</li>)}</ol>}
-                  <p><strong>Answer:</strong> {item.answer}</p>
-                  {item.source_answer && item.question_type === 'fill_blank' && <p><strong>Source explanation:</strong> {item.source_answer}</p>}
                 </li>
               ))}
             </ul>

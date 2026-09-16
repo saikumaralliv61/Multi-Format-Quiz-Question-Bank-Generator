@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.main import app, generate_questions
+from app.main import app, generate_questions, parse_ollama_json
 
 
 class QuizGeneratorApiTests(unittest.TestCase):
@@ -21,6 +21,16 @@ class QuizGeneratorApiTests(unittest.TestCase):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+
+    def test_parse_ollama_json_repairs_malformed_payload(self):
+        content = '{"questions": [{"question": "What is photosynthesis?" "topic": "Biology"}]}'
+
+        result = parse_ollama_json(content)
+
+        self.assertEqual(result["questions"][0]["topic"], "Biology")
+
+    def test_parse_ollama_json_rejects_unrecoverable_payload(self):
+        self.assertIsNone(parse_ollama_json("not JSON at all"))
 
     def test_generate_and_list_questions(self):
         response = self.client.post(
@@ -77,13 +87,44 @@ class QuizGeneratorApiTests(unittest.TestCase):
             question = response.json()["questions"][0]
             self.assertEqual(question["difficulty"], "Hard")
             self.assertEqual(question["question_type"], question_type)
-            self.assertTrue(question["answer"])
-            self.assertTrue(question["source_answer"])
+            self.assertNotIn("answer", question)
+            self.assertNotIn("source_answer", question)
             self.assertNotIn("Theory in General", question["question"])
             if question_type == "quiz":
-                self.assertIn(question["source_answer"][:40], question["question"])
+                self.assertTrue(question["question"])
             if question_type == "mcq":
                 self.assertGreaterEqual(len(question["options"]), 2)
+
+    @patch("app.main.call_ollama")
+    def test_generation_strictly_respects_selected_question_type(self, mock_call_ollama):
+        mock_call_ollama.return_value = {
+            "questions": [
+                {
+                    "question": "What happens in photosynthesis?",
+                    "topic": "Biology",
+                    "unit": "General",
+                    "format": "fill_blank",
+                    "section": "General",
+                    "marks": 2,
+                    "options": [],
+                },
+                {
+                    "question": "What is a cell?",
+                    "topic": "Biology",
+                    "unit": "General",
+                    "format": "fill_blank",
+                    "section": "General",
+                    "marks": 2,
+                    "options": [],
+                },
+            ]
+        }
+
+        questions = generate_questions_with_ollama("Plant cells use sunlight to create energy.", "Easy", "quiz")
+
+        self.assertIsNotNone(questions)
+        self.assertTrue(all(question["format"] == "quiz" for question in questions))
+        self.assertTrue(all(question["question_type"] == "quiz" for question in questions))
 
     def test_generation_uses_all_units_and_ignores_course_intro(self):
         source = (
@@ -102,7 +143,7 @@ class QuizGeneratorApiTests(unittest.TestCase):
         questions = response.json()["questions"]
         units = {question["unit"] for question in questions}
         self.assertEqual(units, {"Unit 1", "Unit I", "Unit 2"})
-        self.assertTrue(all("Course overview" not in question["answer"] for question in questions))
+        self.assertTrue(all("Course overview" not in question["question"] for question in questions))
 
     def test_exam_patterns_and_all_mix(self):
         source = b"Unit 1: Data visualization explains charts and graphs used to communicate patterns clearly. Data cleaning removes errors and prepares reliable datasets for analysis. Statistical summaries describe the central features of a dataset."
@@ -122,6 +163,31 @@ class QuizGeneratorApiTests(unittest.TestCase):
             if question_type == "all_mix":
                 self.assertGreaterEqual(len({question["format"] for question in questions}), 2)
                 self.assertEqual({question["section"] for question in questions}, {"Mid Section A", "Sem Section B"})
+
+    def test_question_type_specific_generation_keeps_schema_valid(self):
+        generated = {
+            "questions": [
+                {
+                    "question": "What does photosynthesis do?",
+                    "topic": "Biology",
+                    "unit": "General",
+                    "format": "quiz",
+                    "section": "General",
+                    "marks": 2,
+                },
+                {
+                    "question": "Fill in the blank: Plants make energy using _________.",
+                    "topic": "Biology",
+                    "unit": "General",
+                    "format": "fill_blank",
+                    "section": "General",
+                    "marks": 2,
+                },
+            ]
+        }
+
+        self.assertIn("questions", generated)
+        self.assertTrue(all("options" not in question for question in generated["questions"]))
 
     def test_analyze_topics_uses_all_pages_without_questions(self):
         source = (
