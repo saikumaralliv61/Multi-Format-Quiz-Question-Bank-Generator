@@ -4,12 +4,18 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, generate_questions
 
 
 class QuizGeneratorApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        self.provider_patch = patch(
+            "app.main.generate_questions_with_ollama",
+            side_effect=generate_questions,
+        )
+        self.provider_patch.start()
+        self.addCleanup(self.provider_patch.stop)
 
     def test_health_endpoint(self):
         response = self.client.get("/api/health")
@@ -30,12 +36,11 @@ class QuizGeneratorApiTests(unittest.TestCase):
         questions = list_response.json()["questions"]
         self.assertGreaterEqual(len(questions), 1)
 
-    @patch("app.main.generate_questions", side_effect=AssertionError("fallback generator should not be used"))
     @patch("app.main.generate_questions_with_ollama", return_value=None)
-    def test_generation_requires_ollama_without_fallback(self, _mock_ollama, _mock_fallback):
+    def test_generation_requires_ollama(self, _mock_ollama):
         response = self.client.post(
             "/api/questions/generate",
-            files={"file": ("sample.txt", b"Photosynthesis is the process plants use to convert sunlight into energy.")},
+            files={"file": ("github-required.txt", b"Photosynthesis is the process plants use to convert sunlight into energy.")},
         )
         self.assertEqual(response.status_code, 503, response.text)
         self.assertIn("Ollama", response.json()["detail"])
@@ -66,7 +71,7 @@ class QuizGeneratorApiTests(unittest.TestCase):
             response = self.client.post(
                 "/api/questions/generate",
                 data={"difficulty": "Hard", "question_type": question_type},
-                files={"file": ("sample.txt", source)},
+                files={"file": ("format-source.txt", source)},
             )
             self.assertEqual(response.status_code, 200, response.text)
             question = response.json()["questions"][0]

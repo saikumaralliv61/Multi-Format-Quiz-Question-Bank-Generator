@@ -126,11 +126,6 @@ Upload Document
 
 This project is likely built using a combination of:
 
-- Frontend: web UI for upload and interaction
-- Backend: Python-based API layer for processing and generation
-- NLP / AI: language model or question-generation logic
-- Data handling: structured storing of generated question data
-- Export: document generation for PDF/DOCX or printable formats
 
 ## Setup
 
@@ -140,15 +135,31 @@ This project is likely built using a combination of:
 4. Install frontend dependencies if the web interface is included.
 5. Start the backend server.
 6. Start the frontend app.
-7. Upload study material and generate the question bank.
+Uploaded documents are stored in the backend SQLite database by SHA-256 content hash.
+The first request extracts and stores the document context. Later requests with
+the same filename reuse that stored context, regardless of difficulty or question
+type. The first uncached generation creates a compact factual Ollama context and
+stores it with the document; later generations send that smaller context instead
+of the full PDF. If compression fails, the backend falls back to the complete
+extracted text. Generated question sets are cached separately for each document
+and setting. The content hash is an internal backend key only; the frontend does
+not need to manage a document identifier.
 
-### Optional local ML generation with Ollama
+### Ollama generation
 
-The backend automatically uses Ollama when it is available at `http://127.0.0.1:11434`. Install Ollama, then download a model:
+The backend uses Ollama's local chat API. Install Ollama, start it, and download the selected model:
 
-```bash
-ollama pull llama3.2
+Create `backend/.env` from [`backend/.env.example`](backend/.env.example):
+
+```bat
+copy backend\.env.example backend\.env
 ```
+
+```bat
+ollama pull llama3.2:1b
+```
+
+The backend loads `backend/.env` automatically. No cloud API key is required. Shell environment variables still work and take precedence over values in the file.
 
 Start the backend with the project virtual environment:
 
@@ -157,23 +168,7 @@ cd backend
 ..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 ```
 
-The default model is `llama3.2`. To use another installed model, set `OLLAMA_MODEL`. The generator uses Ollama exclusively; there is no built-in fallback generator.
-
-On Windows, install Ollama from `https://ollama.com/download/windows`. The installer normally adds `ollama.exe` to PATH. Open a new Command Prompt after installation, then run:
-
-```bat
-ollama pull llama3.2
-ollama serve
-```
-
-If Ollama uses a non-default host or port, set `OLLAMA_HOST` before starting the backend. The value may be a full URL or `host:port`:
-
-```bat
-set OLLAMA_HOST=http://127.0.0.1:11434
-set OLLAMA_MODEL=llama3.2
-```
-
-For a permanent Windows setting, use `setx OLLAMA_HOST http://127.0.0.1:11434`, then open a new terminal. The Ollama executable location and model storage location are separate: `OLLAMA_MODELS` controls model storage, while `OLLAMA_HOST` controls the API address.
+The default model is `llama3.2:1b`. To use another Ollama model, set `OLLAMA_MODEL`. You can also set `OLLAMA_ENDPOINT` for a compatible gateway and `OLLAMA_TIMEOUT` for the request timeout.
 
 ```bash
 git clone <repository-url>

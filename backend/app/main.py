@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
 import os
 import re
 import sqlite3
+from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
@@ -15,12 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pypdf import PdfReader
 import httpx
+from dotenv import load_dotenv
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 from .db import get_connection, init_db
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 app = FastAPI(title="Quiz Question Bank Generator API")
 logger = logging.getLogger(__name__)
@@ -40,10 +45,8 @@ def normalize_text(raw_text: str) -> str:
     return text.strip()
 
 
-def extract_text_from_upload(file: UploadFile) -> str:
-    filename = (file.filename or "").lower()
-    content = file.file.read()
-
+def extract_text_from_content(filename: str, content: bytes) -> str:
+    filename = filename.lower()
     if filename.endswith(".pdf"):
         try:
             reader = PdfReader(io.BytesIO(content))
@@ -56,6 +59,14 @@ def extract_text_from_upload(file: UploadFile) -> str:
         return normalize_text(content.decode("utf-8", errors="ignore"))
 
     raise HTTPException(status_code=400, detail="Unsupported file type. Use .txt, .md, .csv, or .pdf")
+
+
+def extract_text_from_upload(file: UploadFile) -> str:
+    return extract_text_from_content(file.filename or "", file.file.read())
+
+
+def normalize_document_filename(filename: str) -> str:
+    return os.path.basename(filename).strip().lower()
 
 
 def extract_pages_from_upload(file: UploadFile) -> list[str]:
@@ -276,9 +287,198 @@ def save_questions(questions: list[dict[str, str]]) -> None:
         conn.close()
 
 
+def get_cached_questions(cache_key: str) -> list[dict[str, Any]] | None:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT questions_json FROM generation_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if not row:
+            return None
+        cached = json.loads(row["questions_json"])
+        return cached if isinstance(cached, list) else None
+    except json.JSONDecodeError:
+        return None
+    finally:
+        conn.close()
+
+
+def cache_questions(cache_key: str, questions: list[dict[str, Any]]) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO generation_cache (cache_key, questions_json) VALUES (?, ?)",
+            (cache_key, json.dumps(questions)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_document(document_id: str) -> dict[str, str] | None:
+    init_db()
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT document_id, filename, content, ollama_context FROM documents WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_document_by_filename(filename: str) -> dict[str, str] | None:
+    init_db()
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT document_id, filename, content, ollama_context FROM documents WHERE lower(filename) = ?",
+            (normalize_document_filename(filename),),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def save_document(document_id: str, filename: str, content: str) -> None:
+    init_db()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO documents (document_id, filename, content) VALUES (?, ?, ?)",
+            (document_id, normalize_document_filename(filename), content),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_document_context(document_id: str, context: str) -> None:
+    init_db()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE documents SET ollama_context = ? WHERE document_id = ?",
+            (context, document_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+QUESTION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "answer": {"type": "string"},
+                    "source_answer": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "unit": {"type": "string"},
+                    "format": {"type": "string", "enum": ["quiz", "fill_blank", "mcq"]},
+                    "section": {"type": "string"},
+                    "marks": {"type": "integer"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question", "answer", "source_answer", "topic", "unit", "format", "section", "marks", "options"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["questions"],
+    "additionalProperties": False,
+}
+
+
+def call_ollama(
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    response_schema: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/chat").strip().rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:1b").strip()
+    timeout = float(os.getenv("OLLAMA_TIMEOUT", "1020"))
+    native_ollama = endpoint.endswith("/api/chat")
+    try:
+        attempts = [(temperature, max_tokens, 1.15, 128)]
+        if native_ollama:
+            attempts.append((max(temperature, 0.4), max_tokens, 1.25, 256))
+
+        with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0), trust_env=False) as client:
+            for attempt_temperature, attempt_max_tokens, repeat_penalty, repeat_last_n in attempts:
+                request_body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if native_ollama:
+                    request_body.update({
+                        "stream": False,
+                        "format": response_schema or "json",
+                        "options": {
+                            "temperature": attempt_temperature,
+                            "num_predict": attempt_max_tokens,
+                            "repeat_penalty": repeat_penalty,
+                            "repeat_last_n": repeat_last_n,
+                        },
+                    })
+                else:
+                    request_body.update({"temperature": attempt_temperature, "max_tokens": attempt_max_tokens, "response_format": {"type": "json_object"}})
+
+                response = client.post(
+                    endpoint,
+                    headers={"Authorization": "Bearer ollama", "Content-Type": "application/json"},
+                    json=request_body,
+                )
+                if response.status_code != 500 or "repeat limit" not in response.text.lower() or attempt_max_tokens == attempts[-1][1]:
+                    break
+        if response.is_error:
+            logger.error(
+                "Ollama returned HTTP %s from %s: %s",
+                response.status_code,
+                endpoint,
+                response.text[:1000],
+            )
+        response.raise_for_status()
+        response_body = response.json()
+        if response_body.get("error"):
+            logger.error("Ollama prediction failed: %s", response_body["error"])
+            return None
+        content = response_body["message"]["content"] if native_ollama else response_body["choices"][0]["message"]["content"]
+        if not isinstance(content, str):
+            return None
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
+        result = json.loads(content)
+        return result if isinstance(result, dict) else None
+    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.exception("Ollama request failed: %s", exc)
+        return None
+
+
+def compress_document_context(text: str) -> str | None:
+    """Create a reusable factual context once so later generations use a smaller prompt."""
+    prompt = f"""
+Create a compact but complete study context from the supplied document.
+Preserve every important fact, definition, formula, process, example, unit, and relationship.
+Do not add outside knowledge. Organize the result with headings and bullet points.
+Return ONLY valid JSON in this exact shape: {{"context": "..."}}
+
+Document:
+{text}
+"""
+    result = call_ollama(prompt, temperature=0.1, max_tokens=2500)
+    context = result.get("context") if result else None
+    return context.strip() if isinstance(context, str) and context.strip() else None
+
+
 def generate_questions_with_ollama(text: str, difficulty: str, question_type: str) -> list[dict[str, Any]] | None:
-    """Ask a local Ollama model for grounded questions; return None when Ollama is unavailable or fails."""
-    model = os.getenv("OLLAMA_MODEL", "llama3.2")
+    """Ask Ollama for grounded questions; return None when the service fails."""
     prompt = f"""
 You are an academic question generator. Use ONLY the supplied study material.
 Do not use outside knowledge. Do not invent facts. Keep answers grounded in the source.
@@ -298,54 +498,40 @@ Rules:
 - For sem_pattern use Section A (2 marks) and Section B (8 marks).
 - For all_mix, use a mixture of those section styles.
 - Do not mention course titles, unit titles, or generic phrases such as 'Theory in General'.
+- Keep each question under 220 characters and each answer under 180 characters.
+- Return concise JSON without markdown or extra explanation.
 
 Study material:
-{text[:16000]}
+{text}
 """
 
-    try:
-        ollama_host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
-        if not ollama_host.startswith(("http://", "https://")):
-            ollama_host = f"http://{ollama_host}"
-        ollama_timeout = float(os.getenv("OLLAMA_TIMEOUT", "680"))
-        with httpx.Client(timeout=httpx.Timeout(ollama_timeout, connect=10.0), trust_env=False) as client:
-            response = client.post(
-                f"{ollama_host}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "format": "json",
-                    "stream": False,
-                    "keep_alive": "10m",
-                    "options": {"temperature": 0.2, "num_predict": 1200},
-                },
-            )
-        response.raise_for_status()
-        result = json.loads(response.json().get("response", "{}"))
-        generated = result.get("questions")
-        if not isinstance(generated, list) or not generated:
-            return None
-
-        questions = []
-        for index, item in enumerate(generated, start=1):
-            if not isinstance(item, dict) or not item.get("question") or not item.get("answer"):
-                continue
-            item["id"] = index
-            item["difficulty"] = difficulty
-            item["question_type"] = question_type
-            item.setdefault("source_answer", item["answer"])
-            item.setdefault("topic", "Study material")
-            item.setdefault("unit", "General")
-            item.setdefault("format", question_type if question_type in {"quiz", "fill_blank", "mcq"} else "quiz")
-            item.setdefault("section", "General")
-            item.setdefault("marks", 2)
-            if item.get("format") != "mcq":
-                item.pop("options", None)
-            questions.append(item)
-        return questions or None
-    except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        logger.exception("Ollama question generation failed: %s", exc)
+    result = call_ollama(
+        prompt,
+        temperature=0.2,
+        max_tokens=8192,
+        response_schema=QUESTION_RESPONSE_SCHEMA,
+    )
+    generated = result.get("questions") if result else None
+    if not isinstance(generated, list) or not generated:
         return None
+
+    questions = []
+    for index, item in enumerate(generated, start=1):
+        if not isinstance(item, dict) or not item.get("question") or not item.get("answer"):
+            continue
+        item["id"] = index
+        item["difficulty"] = difficulty
+        item["question_type"] = question_type
+        item.setdefault("source_answer", item["answer"])
+        item.setdefault("topic", "Study material")
+        item.setdefault("unit", "General")
+        item.setdefault("format", question_type if question_type in {"quiz", "fill_blank", "mcq"} else "quiz")
+        item.setdefault("section", "General")
+        item.setdefault("marks", 2)
+        if item.get("format") != "mcq":
+            item.pop("options", None)
+        questions.append(item)
+    return questions or None
 
 
 def fetch_questions() -> list[dict[str, Any]]:
@@ -441,19 +627,66 @@ def export_questions(format: str = "json") -> Response:
 
 @app.post("/api/questions/generate")
 async def generate_question_bank(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
     difficulty: str = Form("Medium"),
     question_type: str = Form("quiz"),
+    filename: str | None = Form(None),
 ) -> dict[str, Any]:
-    text = extract_text_from_upload(file)
-    questions = generate_questions_with_ollama(text, difficulty, question_type)
+    if file is not None:
+        upload_filename = file.filename or "uploaded-document"
+        document = get_document_by_filename(upload_filename)
+        file_content = await file.read()
+        if document is None:
+            text = extract_text_from_content(file.filename or "", file_content)
+            document_id = hashlib.sha256(file_content).hexdigest()
+            save_document(document_id, file.filename or "uploaded-document", text)
+            document = get_document(document_id)
+        else:
+            document_id = document["document_id"]
+            text = document["content"]
+    elif filename:
+        document = get_document_by_filename(filename)
+        if document is None:
+            raise HTTPException(status_code=404, detail="Stored filename was not found. Upload the document first.")
+        document_id = document["document_id"]
+        text = document["content"]
+    else:
+        raise HTTPException(status_code=400, detail="Upload a document or provide a stored filename.")
+
+    model = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+    cache_key = hashlib.sha256(
+        b"|".join((document_id.encode(), difficulty.encode(), question_type.encode(), model.encode()))
+    ).hexdigest()
+    cached_questions = get_cached_questions(cache_key)
+    if cached_questions:
+        return {
+            "questions": cached_questions,
+            "count": len(cached_questions),
+            "cached": True,
+            "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),
+        }
+
+    context = document.get("ollama_context")
+    if not context:
+        context = compress_document_context(text)
+        if context:
+            save_document_context(document_id, context)
+
+    questions = generate_questions_with_ollama(context or text, difficulty, question_type)
     if not questions:
         raise HTTPException(
             status_code=503,
-            detail="Ollama generation failed or is unavailable. Please ensure Ollama is running and the model is installed.",
+            detail="Ollama generation failed or is unavailable. Start Ollama, pull the selected model, and try again.",
         )
     save_questions(questions)
-    return {"questions": questions, "count": len(questions)}
+    cache_questions(cache_key, questions)
+    return {
+        "questions": questions,
+        "count": len(questions),
+        "cached": False,
+        "context_cached": bool(context),
+        "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),
+    }
 
 
 @app.post("/api/topics/analyze")

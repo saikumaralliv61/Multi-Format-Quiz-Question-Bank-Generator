@@ -68,6 +68,7 @@ function App() {
 
   const clearSavedPaper = () => {
     setQuestions([]);
+    setFile(null);
     localStorage.removeItem('quiz-question-paper');
   };
 
