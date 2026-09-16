@@ -142,6 +142,39 @@ This project is likely built using a combination of:
 6. Start the frontend app.
 7. Upload study material and generate the question bank.
 
+### Optional local ML generation with Ollama
+
+The backend automatically uses Ollama when it is available at `http://127.0.0.1:11434`. Install Ollama, then download a model:
+
+```bash
+ollama pull llama3.2
+```
+
+Start the backend with the project virtual environment:
+
+```bash
+cd backend
+..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
+```
+
+The default model is `llama3.2`. To use another installed model, set `OLLAMA_MODEL`. The generator uses Ollama exclusively; there is no built-in fallback generator.
+
+On Windows, install Ollama from `https://ollama.com/download/windows`. The installer normally adds `ollama.exe` to PATH. Open a new Command Prompt after installation, then run:
+
+```bat
+ollama pull llama3.2
+ollama serve
+```
+
+If Ollama uses a non-default host or port, set `OLLAMA_HOST` before starting the backend. The value may be a full URL or `host:port`:
+
+```bat
+set OLLAMA_HOST=http://127.0.0.1:11434
+set OLLAMA_MODEL=llama3.2
+```
+
+For a permanent Windows setting, use `setx OLLAMA_HOST http://127.0.0.1:11434`, then open a new terminal. The Ollama executable location and model storage location are separate: `OLLAMA_MODELS` controls model storage, while `OLLAMA_HOST` controls the API address.
+
 ```bash
 git clone <repository-url>
 cd Multi-Format-Quiz-Question-Bank-Generator
