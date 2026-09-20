@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pypdf import PdfReader
@@ -202,13 +202,31 @@ def extract_unit_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+def is_non_question_content(sentence: str) -> bool:
+    return bool(re.search(
+        r"\b(?:course title|course name|course overview|course objectives?|course outcomes?|"
+        r"learning objectives?|learning outcomes?|objectives?|outcomes?|syllabus|introduction|"
+        r"about this course|this course teaches|the course covers|text books?|textbooks?|"
+        r"reference books?|references?|bibliography|suggested readings|"
+        r"publisher|publishers|press|pearson|mcgraw|sultan chand|kalyani|oxford university press|"
+        r"\b(?:19|20)\d{2}\b)",
+        sentence,
+        re.IGNORECASE,
+    ))
+
+
+def filter_generation_source(text: str) -> str:
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return " ".join(sentence.strip() for sentence in sentences if sentence.strip() and not is_non_question_content(sentence))
+
+
 def generate_questions(text: str, difficulty: str = "Medium", question_type: str = "quiz") -> list[dict[str, Any]]:
     difficulty_options = {"Easy", "Medium", "Hard"}
     question_type_options = {"quiz", "fill_blank", "mcq", "mid_pattern", "sem_pattern", "all_mix"}
     if difficulty not in difficulty_options:
         raise HTTPException(status_code=400, detail="Difficulty must be Easy, Medium, or Hard.")
     if question_type not in question_type_options:
-        raise HTTPException(status_code=400, detail="Question type must be quiz, fill_blank, or mcq.")
+        raise HTTPException(status_code=400, detail="Unsupported question type.")
 
     unit_sections = extract_unit_sections(text)
     if not any(section_text.strip() for _, section_text in unit_sections):
@@ -218,8 +236,19 @@ def generate_questions(text: str, difficulty: str = "Medium", question_type: str
     question_id = 1
     for unit_label, section_text in unit_sections:
         sentences = re.split(r"(?<=[.!?])\s+", section_text)
-        sentences = [sentence.strip() for sentence in sentences if len(sentence.strip()) > 40]
-        selected = sentences[:10] if question_type in {"mid_pattern", "sem_pattern", "all_mix"} else sentences[:5]
+        sentences = [
+            sentence.strip()
+            for sentence in sentences
+            if len(sentence.strip()) > 40 and not is_non_question_content(sentence)
+        ]
+        if question_type == "all_mix":
+            selected = sentences[:3]
+        elif question_type == "mid_pattern":
+            selected = sentences[:16]
+        elif question_type == "sem_pattern":
+            selected = sentences[:10]
+        else:
+            selected = sentences[:5]
 
         for position, sentence in enumerate(selected, start=1):
             topic = sentence.split()[0:4]
@@ -227,26 +256,21 @@ def generate_questions(text: str, difficulty: str = "Medium", question_type: str
             section = "General"
             marks = 2
             if question_type == "mid_pattern":
-                section = "Section A" if position <= 5 else "Section B"
-                marks = 1 if position <= 5 else 5
+                section = "Section A" if position <= 10 else "Section B"
+                marks = 1 if position <= 10 else 5
                 generated_type = "quiz"
             elif question_type == "sem_pattern":
                 section = "Section A" if position <= 5 else "Section B"
                 marks = 2 if position <= 5 else 8
                 generated_type = "quiz"
             elif question_type == "all_mix":
-                generated_type = ("quiz", "fill_blank", "mcq")[(position - 1) % 3]
-                if position % 2:
-                    section = "Mid Section A"
-                    marks = 1
-                else:
-                    section = "Sem Section B"
-                    marks = 8
+                generated_type = ("mcq", "fill_blank", "quiz")[(position - 1) % 3]
+                section = "Mixed Questions"
+                marks = 1
 
             question: dict[str, Any] = {
                 "id": question_id,
-                "answer": sentence[:200],
-                "source_answer": sentence[:200],
+                "question_number": question_id,
                 "difficulty": difficulty,
                 "topic": " ".join(topic),
                 "unit": unit_label,
@@ -260,19 +284,21 @@ def generate_questions(text: str, difficulty: str = "Medium", question_type: str
                 words = sentence.split()
                 answer_word = words[0].strip(".,!?;:")
                 question["question"] = sentence.replace(answer_word, "________", 1)
-                question["answer"] = answer_word
             elif generated_type == "mcq":
                 correct_answer = sentence[:100]
                 distractors = [other[:100] for other in selected if other != sentence][:3]
                 options = [correct_answer, *distractors]
                 question["question"] = f"Which statement best matches this topic in {unit_label}: {' '.join(topic)}?"
                 question["options"] = options
-                question["answer"] = correct_answer
             else:
                 if question_type == "mid_pattern":
-                    question["question"] = f"Explain briefly the concept described in this statement: '{sentence[:260]}'"
+                        if section == "Section A":
+                            wh_starts = ("What", "Why", "How", "Where", "When")
+                            question["question"] = f"{wh_starts[(position - 1) % len(wh_starts)]} is the main concept described in this statement: '{sentence[:260]}'?"
+                        else:
+                            question["question"] = f"Discuss the concept and its key points: '{sentence[:260]}'"
                 elif question_type == "sem_pattern":
-                    question["question"] = f"Explain in detail the concept described in this statement, including its key points: '{sentence[:260]}'"
+                    question["question"] = f"Describe the concept in this sentence and discuss its key points: '{sentence[:260]}'"
                 else:
                     question["question"] = f"What is the main concept explained in this statement from {unit_label}: '{sentence[:260]}'?"
 
@@ -337,6 +363,39 @@ def save_document_context(document_id: str, context: str) -> None:
         conn.close()
 
 
+def get_cached_questions(document_id: str, difficulty: str, question_type: str) -> list[dict[str, Any]] | None:
+    cache_key = f"v12:{document_id}:{difficulty}:{question_type}"
+    init_db()
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT questions_json FROM generation_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+        if not row:
+            return None
+        questions = json.loads(row["questions_json"])
+        return questions if isinstance(questions, list) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+    finally:
+        conn.close()
+
+
+def save_cached_questions(document_id: str, difficulty: str, question_type: str, questions: list[dict[str, Any]]) -> None:
+    cache_key = f"v12:{document_id}:{difficulty}:{question_type}"
+    init_db()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO generation_cache (cache_key, questions_json) VALUES (?, ?)",
+            (cache_key, json.dumps(questions)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 QUESTION_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -352,6 +411,7 @@ QUESTION_RESPONSE_SCHEMA = {
                     "section": {"type": "string"},
                     "marks": {"type": "integer"},
                     "options": {"type": "array", "items": {"type": "string"}},
+                    "answer": {"type": "string"},
                 },
                 "required": ["question", "topic", "unit", "format", "section", "marks"],
                 "additionalProperties": False,
@@ -363,6 +423,30 @@ QUESTION_RESPONSE_SCHEMA = {
 }
 
 
+EXAM_PATTERNS = {
+    "mid_pattern": {
+        "section_a_count": 10,
+        "section_a_marks": 1,
+        "section_b_count": 6,
+        "section_b_marks": 5,
+        "section_a_instruction": "Answer all questions",
+        "section_a_marks_label": "1 x 10 = 10 marks",
+        "section_b_instruction": "Answer any four questions",
+        "section_b_marks_label": "4 x 5 = 20 marks",
+    },
+    "sem_pattern": {
+        "section_a_count": 5,
+        "section_a_marks": 2,
+        "section_b_count": 5,
+        "section_b_marks": 8,
+        "section_a_instruction": "Answer all questions",
+        "section_a_marks_label": "2 x 5 = 10 marks",
+        "section_b_instruction": "Answer all questions",
+        "section_b_marks_label": "5 x 8 = 40 marks",
+    },
+}
+
+
 def call_ollama(
     prompt: str,
     temperature: float,
@@ -371,50 +455,53 @@ def call_ollama(
 ) -> dict[str, Any] | None:
     endpoint = os.getenv("OLLAMA_ENDPOINT", "http://localhost:11434/api/generate").strip().rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "llama3.2:latest").strip()
-    timeout = float(os.getenv("OLLAMA_TIMEOUT", "1020"))
+    timeout = min(float(os.getenv("OLLAMA_TIMEOUT", "120")), 180.0)
     native_ollama = endpoint.endswith("/api/generate")
+    request_options = {
+        "temperature": temperature,
+        "num_predict": max_tokens,
+        "repeat_penalty": 1.15,
+        "repeat_last_n": 128,
+    }
+    formats = [response_schema or "json"] if native_ollama else [None]
+    if native_ollama and response_schema:
+        formats.append("json")
+
     try:
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0), trust_env=False) as client:
-            request_body = {
-                "model": model,
-                "prompt": prompt,
-            }
-            if native_ollama:
-                request_body.update({
-                    "stream": False,
-                    "format": response_schema or "json",
-                    "options": {
+            for output_format in formats:
+                request_body = {"model": model, "prompt": prompt}
+                if native_ollama:
+                    request_body.update({"stream": False, "format": output_format, "options": request_options})
+                else:
+                    request_body.update({
                         "temperature": temperature,
-                        "num_predict": max_tokens,
-                        "repeat_penalty": 1.15,
-                        "repeat_last_n": 128,
-                    },
-                })
-            else:
-                request_body.update({"temperature": temperature, "max_tokens": max_tokens, "response_format": {"type": "json_object"}})
+                        "max_tokens": max_tokens,
+                        "response_format": {"type": "json_object"},
+                    })
 
-            response = client.post(
-                endpoint,
-                headers={"Authorization": "Bearer ollama", "Content-Type": "application/json"},
-                json=request_body,
-            )
-        if response.is_error:
-            logger.error(
-                "Ollama returned HTTP %s from %s: %s",
-                response.status_code,
-                endpoint,
-                response.text[:1000],
-            )
-        response.raise_for_status()
-        response_body = response.json()
-        if response_body.get("error"):
-            logger.error("Ollama prediction failed: %s", response_body["error"])
-            return None
-        content = response_body["response"] if native_ollama else response_body["choices"][0]["message"]["content"]
-        if not isinstance(content, str):
-            return None
-        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
-        return parse_ollama_json(content)
+                response = client.post(
+                    endpoint,
+                    headers={"Authorization": "Bearer ollama", "Content-Type": "application/json"},
+                    json=request_body,
+                )
+                if response.is_error:
+                    logger.warning("Ollama returned HTTP %s using format %s: %s", response.status_code, output_format, response.text[:500])
+                    continue
+
+                response_body = response.json()
+                if response_body.get("error"):
+                    logger.warning("Ollama prediction failed using format %s: %s", output_format, response_body["error"])
+                    continue
+                content = response_body["response"] if native_ollama else response_body["choices"][0]["message"]["content"]
+                if not isinstance(content, str):
+                    continue
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
+                parsed = parse_ollama_json(content)
+                if parsed is not None:
+                    return parsed
+                logger.warning("Ollama returned invalid JSON using format %s", output_format)
+        return None
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
         logger.exception("Ollama request failed: %s", exc)
         return None
@@ -442,55 +529,65 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
         "You are an academic question generator. Use ONLY the supplied study material.",
         "Do not use outside knowledge. Do not invent facts. Keep every question grounded in the source.",
         "Do not mention course titles, unit titles, or generic phrases such as 'Theory in General'.",
+        "Do not ask questions about the course title, course name, course overview, course objectives, course outcomes, learning objectives, or learning outcomes.",
+        "Do not ask questions about textbooks, text books, reference books, bibliography, references, or suggested readings.",
         "Keep each question under 220 characters.",
         "Return concise JSON without markdown or extra explanation.",
         "Difficulty: " + difficulty,
         "Requested format: " + question_type,
         "Return ONLY valid JSON in this exact shape:",
-        '{"questions": [{"question": "...", "topic": "...", "unit": "...", "format": "quiz|fill_blank|mcq", "section": "...", "marks": 1, "options": []}]}',
+        '{"questions": [{"question": "...", "topic": "...", "unit": "...", "format": "quiz|fill_blank|mcq", "section": "...", "marks": 1, "options": [], "answer": "..."}]}',
     ]
 
     if question_type == "quiz":
         dynamic_rules = [
             "Create exactly 5 quiz questions.",
+            "Use varied WH-style openings such as What, Why, How, Where, and When; do not start every question with the same phrase.",
             "Use a direct short-answer style question with no answer key in the output.",
             "Each question must be clear, factual, and answerable from the material.",
         ]
     elif question_type == "fill_blank":
         dynamic_rules = [
             "Create exactly 5 fill-in-the-blank questions.",
-            "Include one blank and do not provide the missing phrase separately.",
+            "Each question must contain exactly one literal blank written as ____ (four underscores).",
+            "Keep the blank in the sentence; do not remove it or return only the completed sentence.",
             "Do not include answer keys or explanations.",
             "Keep the sentence grammatically correct after the blank is inserted.",
         ]
     elif question_type == "mcq":
         dynamic_rules = [
-            "Create exactly 5 MCQ questions.",
-            "Provide 2 to 4 options in the options array and do not reveal the correct answer.",
+            "Create exactly 7 MCQ questions.",
+            "Provide exactly 4 different options in the options array.",
+            "Every option must be a possible answer, not a copy or paraphrase of the question.",
+            "Never repeat an option, and never use the full question as an option.",
             "Use plausible distractors grounded in the study material.",
+            "Put the correct option first, and make the answer field exactly match that first option.",
             "The format field must be 'mcq'.",
         ]
     elif question_type == "mid_pattern":
         dynamic_rules = [
-            "Create up to 10 questions total.",
-            "Use Section A for the first 5 questions (1 mark each) and Section B for the remaining questions (5 marks each).",
-            "Format should be quiz-style questions, without MCQ or fill_blank variants.",
-            "Keep the mix balanced between brief factual recall and short explanations.",
+            "Reproduce this exact mid-examination pattern: Section A contains exactly 10 WH-style short-answer questions worth 1 mark each, and Section B contains exactly 6 descriptive questions worth 5 marks each.",
+            "Section A instruction: 'Answer all questions'; Section A marks: '1 x 10 = 10 marks'. Section B instruction: 'Answer any four questions'; Section B marks: '4 x 5 = 20 marks'.",
+            "Return exactly 16 questions: question numbers 1-10 in Section A and 11-16 in Section B.",
+            "Format must be quiz-style only, without MCQ or fill_blank variants.",
+            "Return questions only. Do not include answer keys, answers, explanations, or source answers.",
+            "Section A questions must vary WH openings such as What, Why, How, Where, and When. Section B should test explanation, discussion, comparison, process, and application.",
         ]
     elif question_type == "sem_pattern":
         dynamic_rules = [
-            "Create up to 10 questions total.",
-            "Use Section A for the first 5 questions (2 marks each) and Section B for the remaining questions (8 marks each).",
-            "Format should be quiz-style questions, without MCQ or fill_blank variants.",
-            "Prefer deeper conceptual questions in Section B.",
+            "Reproduce this exact semester-examination pattern: Section A contains exactly 5 short-answer questions worth 2 marks each; Section B contains exactly 5 descriptive questions worth 8 marks each.",
+            "Both sections use the instruction 'Answer all questions'. Section A marks are '2 x 5 = 10 marks' and Section B marks are '5 x 8 = 40 marks'.",
+            "Return exactly 10 questions: question numbers 1-5 in Section A and 6-10 in Section B.",
+            "Format must be quiz-style only, without MCQ or fill_blank variants.",
+            "Return questions only. Do not include answer keys, answers, explanations, or source answers.",
+            "Use the supplied sentences directly to form questions. Do not use What, Why, When, Where, or How openings.",
+            "Section A questions 1-5 should test concise concepts. Section B questions 6-10 should use the same direct sentence-based format while testing deeper explanation, illustration, comparison, process, charting, or application.",
         ]
     elif question_type == "all_mix":
         dynamic_rules = [
-            "Create up to 10 questions total.",
-            "Mix quiz, fill_blank, and mcq formats across the set.",
-            "Use a natural blend and ensure no single type dominates the entire set.",
-            "For odd positions, use Mid Section A style with 1 mark; for even positions, use Sem Section B style with 8 marks.",
-            "The overall output should contain a range of question styles, not only one type.",
+            "Create exactly 3 questions total: exactly 1 MCQ, exactly 1 fill-in-the-blank, and exactly 1 WH-style short-answer question.",
+            "Use formats mcq, fill_blank, and quiz exactly once each, in that order.",
+            "The WH-style question must begin with What, Why, When, Where, or How.",
         ]
     else:
         dynamic_rules = ["Create a valid set of grounded questions matching the requested format."]
@@ -511,14 +608,105 @@ def normalize_question_format(question_type: str, item: dict[str, Any]) -> str:
     return "quiz"
 
 
+def normalize_exam_pattern(question_type: str, questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply the selected reference paper's section and marks contract."""
+    pattern = EXAM_PATTERNS.get(question_type)
+    if not pattern:
+        return questions
+
+    expected_count = pattern["section_a_count"] + pattern["section_b_count"]
+    if len(questions) != expected_count:
+        return []
+
+    for index, question in enumerate(questions):
+        in_section_a = index < pattern["section_a_count"]
+        question["section"] = "Section A" if in_section_a else "Section B"
+        question["marks"] = pattern["section_a_marks"] if in_section_a else pattern["section_b_marks"]
+        question["pattern_question_number"] = index + 1
+        unit = question.get("unit")
+        if isinstance(unit, str) and re.match(r"^\s*[IVXLCDM]+\s+Introduction\s+to\b", unit, re.IGNORECASE):
+            question["unit"] = "General"
+        if not in_section_a and question_type == "sem_pattern":
+            question["or_pair"] = ((index - pattern["section_a_count"]) // 2) + 1
+    return questions
+
+
+def normalize_fill_blank_question(question: str) -> str:
+    """Ensure a model response visibly contains a blank for this format."""
+    if re.search(r"_{2,}", question):
+        return re.sub(r"_{2,}", "____", question, count=1)
+
+    words = list(re.finditer(r"\b[A-Za-z][A-Za-z-]{4,}\b", question))
+    if words:
+        match = words[0]
+        return f"{question[:match.start()]}____{question[match.end():]}"
+    return f"{question.rstrip('.')} ____"
+
+
+def normalize_mcq_options(question: str, options: Any) -> list[str] | None:
+    """Keep only distinct answer choices and reject the old repeated-question fallback."""
+    if not isinstance(options, list):
+        return None
+
+    cleaned = []
+    seen = set()
+    normalized_question = re.sub(r"\s+", " ", question).strip().casefold()
+    for option in options:
+        if not isinstance(option, str):
+            continue
+        value = re.sub(r"\s+", " ", option).strip()
+        normalized_value = value.casefold()
+        if not value or normalized_value == normalized_question or normalized_value in seen:
+            continue
+        seen.add(normalized_value)
+        cleaned.append(value)
+
+    return cleaned if len(cleaned) >= 2 else None
+
+
+def normalize_answer_text(value: str) -> str:
+    """Compare model answer text without punctuation or option-label differences."""
+    value = re.sub(r"^\s*[A-D][.):-]\s*", "", value, flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def fallback_mcq_options(question: str, text: str) -> list[str] | None:
+    """Use distinct source statements when the model returns unusable choices."""
+    candidates = re.split(r"(?<=[.!?])\s+", text)
+    source_options = []
+    normalized_question = re.sub(r"\s+", " ", question).strip().casefold()
+    for candidate in candidates:
+        value = re.sub(r"\s+", " ", candidate).strip(" -\t")
+        if len(value) < 20 or value.casefold() == normalized_question:
+            continue
+        if value.casefold() not in {option.casefold() for option in source_options}:
+            source_options.append(value[:220])
+        if len(source_options) == 4:
+            break
+    return source_options if len(source_options) >= 2 else None
+
+
 def generate_questions_with_ollama(text: str, difficulty: str, question_type: str) -> list[dict[str, Any]] | None:
     """Ask Ollama for grounded questions; return None when the service fails."""
-    prompt = build_question_generation_prompt(text, difficulty, question_type)
+    # Keep the prompt within the local model's context window for large uploads.
+    generation_text = filter_generation_source(text)
+    generation_text = generation_text[:6000 if question_type in EXAM_PATTERNS else 7000]
+    prompt = build_question_generation_prompt(generation_text, difficulty, question_type)
 
     result = call_ollama(
         prompt,
         temperature=0.2,
-        max_tokens=1200,
+        max_tokens=(
+            5200
+            if question_type == "sem_pattern"
+            else 4200
+            if question_type == "mid_pattern"
+            else 1400
+            if question_type == "mcq"
+            else 900
+            if question_type == "fill_blank"
+            else 700
+        ),
         response_schema=QUESTION_RESPONSE_SCHEMA,
     )
     generated = result.get("questions") if result else None
@@ -529,8 +717,11 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
     for index, item in enumerate(generated, start=1):
         if not isinstance(item, dict) or not item.get("question"):
             continue
+        if is_non_question_content(f"{item.get('question', '')} {item.get('topic', '')}"):
+            continue
 
         item["id"] = index
+        item["question_number"] = index
         item["difficulty"] = difficulty
         item["question_type"] = question_type
         item.setdefault("topic", "Study material")
@@ -540,20 +731,46 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
 
         item["format"] = normalize_question_format(question_type, item)
 
-        if question_type in {"quiz", "fill_blank", "mid_pattern", "sem_pattern"}:
+        if item["format"] == "fill_blank":
+            item["question"] = normalize_fill_blank_question(str(item["question"]))
             item.pop("options", None)
-        elif question_type == "mcq":
-            options = item.get("options")
-            if not isinstance(options, list) or len(options) < 2:
-                item["options"] = [item["question"], item["question"], item["question"]]
+        elif item["format"] == "quiz":
+            item.pop("options", None)
+            item.pop("answer", None)
+            item.pop("source_answer", None)
+        elif item["format"] == "mcq":
+            options = normalize_mcq_options(str(item["question"]), item.get("options"))
+            if options is None:
+                options = fallback_mcq_options(str(item["question"]), generation_text)
+            if options is None:
+                continue
+            item["options"] = options
         elif question_type == "all_mix":
             if item.get("format") != "mcq":
                 item.pop("options", None)
+
+        if question_type == "sem_pattern":
+            question_text = str(item["question"]).strip()
+            if re.search(r"explain in detail the concept described in this statement|can this concept be understood in detail|does this sentence describe", question_text, re.IGNORECASE) or re.match(r"^(what|why|when|where|how)\b", question_text, re.IGNORECASE):
+                item["question"] = f"Describe the concept in this sentence and discuss its key points: {question_text.rstrip('?')}"
 
         questions.append(item)
 
     if not questions:
         return None
+
+    if question_type == "all_mix":
+        by_format = {format_name: [item for item in questions if item.get("format") == format_name] for format_name in ("mcq", "fill_blank", "quiz")}
+        if any(len(items) != 1 for items in by_format.values()):
+            return None
+        questions = [by_format[format_name][0] for format_name in ("mcq", "fill_blank", "quiz")]
+        if not re.match(r"^(what|why|when|where|how)\b", questions[2]["question"].strip(), re.IGNORECASE):
+            questions[2]["question"] = f"What is the main concept described here: {questions[2]['question']}"
+
+    if question_type in EXAM_PATTERNS:
+        questions = normalize_exam_pattern(question_type, questions)
+        if not questions:
+            return None
 
     if question_type in {"quiz", "fill_blank", "mcq"}:
         if any(item.get("format") != question_type for item in questions):
@@ -561,6 +778,10 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
     elif question_type in {"mid_pattern", "sem_pattern"}:
         if any(item.get("format") != "quiz" for item in questions):
             return None
+
+    for item in questions:
+        item.pop("answer", None)
+        item.pop("source_answer", None)
 
     return questions
 
@@ -593,9 +814,21 @@ def list_questions() -> dict[str, Any]:
     return {"questions": questions, "count": len(questions)}
 
 
-@app.get("/api/questions/export")
-def export_questions(format: str = "json") -> Response:
-    questions = fetch_questions()
+@app.api_route("/api/questions/export", methods=["GET", "POST"])
+def export_questions(format: str = "json", payload: dict[str, Any] | None = Body(None)) -> Response:
+    if payload and isinstance(payload.get("questions"), list):
+        questions = [
+            {
+                "id": question.get("id"),
+                "text": question.get("question", question.get("text", "")),
+                "difficulty": question.get("difficulty", ""),
+                "topic": question.get("topic", ""),
+            }
+            for question in payload["questions"]
+            if isinstance(question, dict) and question.get("question", question.get("text"))
+        ]
+    else:
+        questions = fetch_questions()
 
     if format == "json":
         return JSONResponse({"questions": questions, "count": len(questions)})
@@ -663,17 +896,15 @@ async def generate_question_bank(
     filename: str | None = Form(None),
 ) -> dict[str, Any]:
     if file is not None:
-        upload_filename = file.filename or "uploaded-document"
-        document = get_document_by_filename(upload_filename)
         file_content = await file.read()
+        upload_filename = file.filename or "uploaded-document"
+        document_id = hashlib.sha256(file_content).hexdigest()
+        document = get_document(document_id)
         if document is None:
             text = extract_text_from_content(file.filename or "", file_content)
-            document_id = hashlib.sha256(file_content).hexdigest()
             save_document(document_id, file.filename or "uploaded-document", text)
             document = get_document(document_id)
-        else:
-            document_id = document["document_id"]
-            text = document["content"]
+        text = document["content"]
     elif filename:
         document = get_document_by_filename(filename)
         if document is None:
@@ -684,12 +915,19 @@ async def generate_question_bank(
         raise HTTPException(status_code=400, detail="Upload a document or provide a stored filename.")
 
     context = document.get("ollama_context")
+    # Avoid a second Ollama request before generation; it makes normal uploads feel stuck.
+    # Cached contexts remain supported, while new requests use the source directly.
     if not context:
-        context = compress_document_context(text)
-        if context:
-            save_document_context(document_id, context)
+        context = text
 
-    questions = generate_questions_with_ollama(context or text, difficulty, question_type)
+    questions = get_cached_questions(document_id, difficulty, question_type)
+    cached = questions is not None
+    if not cached:
+        questions = generate_questions_with_ollama(context or text, difficulty, question_type)
+        if not questions:
+            questions = generate_questions(text, difficulty, question_type)
+        if questions:
+            save_cached_questions(document_id, difficulty, question_type, questions)
     if not questions:
         raise HTTPException(
             status_code=503,
@@ -703,7 +941,7 @@ async def generate_question_bank(
     return {
         "questions": public_questions,
         "count": len(public_questions),
-        "cached": False,
+        "cached": cached,
         "context_cached": bool(context),
         "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),
     }

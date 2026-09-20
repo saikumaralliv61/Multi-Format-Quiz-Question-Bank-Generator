@@ -186,6 +186,23 @@ button:disabled {
   gap: 1rem;
 }
 
+.section-heading {
+  list-style: none;
+  border-top: 2px solid var(--accent, #2f5d50);
+  border-bottom: 1px solid #d7ddd8;
+  padding: 0.85rem 0;
+  margin: 1.25rem 0 0.25rem;
+}
+
+.section-heading h3,
+.section-heading p {
+  margin: 0.15rem 0;
+}
+
+.section-heading h3 {
+  color: var(--accent, #2f5d50);
+}
+
 .question-item {
   position: relative;
   overflow: hidden;

@@ -12,6 +12,31 @@ async function readApiResponse(response) {
   throw new Error(message || `Request failed with status ${response.status}`);
 }
 
+function visibleUnit(unit) {
+  if (typeof unit === 'string' && /^\s*[IVXLCDM]+\s+Introduction\s+to\b/i.test(unit)) {
+    return '';
+  }
+  return unit || 'General';
+}
+
+function sectionHeading(section, difficulty, questionType) {
+  if (questionType === 'mid_pattern') {
+    return {
+        instruction: section === 'Section A' ? 'Answer all questions' : 'Answer any four questions',
+        marks: section === 'Section A' ? '1 x 10 = 10 marks' : '4 x 5 = 20 marks',
+      difficulty,
+    };
+  }
+  if (questionType === 'sem_pattern') {
+    return {
+      instruction: 'Answer all questions',
+      marks: section === 'Section A' ? '2 x 5 = 10 marks' : '5 x 8 = 40 marks',
+      difficulty,
+    };
+  }
+  return { instruction: 'Answer all questions', marks: '1 x 10 = 10 marks', difficulty };
+}
+
 function App() {
   const [file, setFile] = React.useState(null);
   const [questions, setQuestions] = React.useState(() => {
@@ -81,7 +106,14 @@ function App() {
     setExporting(true);
     setError('');
     try {
-      const response = await fetch(`/api/questions/export?format=${format}`);
+      const request = format === 'pdf'
+        ? {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ questions }),
+          }
+        : { method: 'GET' };
+      const response = await fetch(`/api/questions/export?format=${format}`, request);
       if (!response.ok) {
         const errorData = await readApiResponse(response);
         throw new Error(errorData.detail || 'Export failed');
@@ -94,7 +126,7 @@ function App() {
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(href);
+      window.setTimeout(() => URL.revokeObjectURL(href), 1000);
     } catch (err) {
       setError(err.message || 'Something went wrong while exporting.');
     } finally {
@@ -156,13 +188,21 @@ function App() {
             <p>No questions generated yet.</p>
           ) : (
             <ul className="question-list">
-              {questions.map((item) => (
-                <li key={item.id} className="question-item">
-                  <p className="meta">{item.unit || 'General'} • {item.section || 'General'} • {item.marks || 0} marks • {item.format || item.question_type} • {item.topic} • {item.difficulty}</p>
-                  <h3>{item.question}</h3>
-                  {item.options && <ol className="options-list">{item.options.map((option) => <li key={option}>{option}</li>)}</ol>}
-                </li>
-              ))}
+              {questions.map((item, index) => {
+                const isExamPattern = item.question_type === 'mid_pattern' || item.question_type === 'sem_pattern';
+                const startsSection = isExamPattern && (index === 0 || item.section !== questions[index - 1].section);
+                const heading = startsSection ? sectionHeading(item.section, item.difficulty, item.question_type) : null;
+                return (
+                  <React.Fragment key={item.id}>
+                    {heading && <li className="section-heading"><h3>{item.section}</h3><p>{heading.instruction}</p><p>Marks: {heading.marks}</p><p>Difficulty: {heading.difficulty}</p></li>}
+                    <li className="question-item">
+                      <p className="meta">{visibleUnit(item.unit) && `${visibleUnit(item.unit)} • `}{item.section || 'General'} • {item.marks || 0} marks • {item.format || item.question_type} • {item.topic} • {item.difficulty}</p>
+                      <h3>{item.question_number || item.pattern_question_number || index + 1}. {item.question}</h3>
+                      {item.options && <ol className="options-list">{item.options.map((option) => <li key={option}>{option}</li>)}</ol>}
+                    </li>
+                  </React.Fragment>
+                );
+              })}
             </ul>
           )}
         </section>
