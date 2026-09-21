@@ -574,12 +574,7 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
         ]
     elif question_type == "mid_pattern":
         dynamic_rules = [
-            "Reproduce this exact mid-examination pattern: Section A contains exactly 10 WH-style short-answer questions worth 1 mark each, and Section B contains exactly 6 descriptive questions worth 5 marks each.",
-            "Section A instruction: 'Answer all questions'; Section A marks: '1 x 10 = 10 marks'. Section B instruction: 'Answer any four questions'; Section B marks: '4 x 5 = 20 marks'.",
-            "Return exactly 16 questions: question numbers 1-10 in Section A and 11-16 in Section B.",
-            "Format must be quiz-style only, without MCQ or fill_blank variants.",
-            "Return questions only. Do not include answer keys, answers, explanations, or source answers.",
-            "Section A questions must vary WH openings such as What, Why, How, Where, and When. Section B should test explanation, discussion, comparison, process, and application.",
+            "Generate 5 short answer questions for unit 1 and remaining from unit 2 and 3 questions for long answers from unit 1 and remaining 3 from unit 2 ",
         ]
     elif question_type == "sem_pattern":
         dynamic_rules = [
