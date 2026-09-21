@@ -544,9 +544,7 @@ Document:
 def build_question_generation_prompt(text: str, difficulty: str, question_type: str) -> str:
     """Create a compact prompt tuned to the selected question generation mode."""
     base_rules = [
-        "You are an academic question generator. Use ONLY the supplied study material.",
-        "Difficulty: " + difficulty,
-        "Do not generate answers, return only questions."
+        "Difficulty: " + difficulty
     ]
 
     if question_type == "quiz":
@@ -585,9 +583,7 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
         ]
     elif question_type == "sem_pattern":
         dynamic_rules = [
-            "Generate 5 short answer questions and 5 long answer questions",
-            "Return ONLY valid JSON in this exact shape:",
-            '{"questions": [{"question": "..."]}',
+            "Generate 5 questions for short answers and 5 questions for long answers, provide only questions",
         ]
     elif question_type == "all_mix":
         dynamic_rules = [
@@ -598,7 +594,7 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
     else:
         dynamic_rules = ["Create a valid set of grounded questions matching the requested format."]
 
-    prompt = "\n".join(base_rules + dynamic_rules + ["Study material:", text])
+    prompt = "\n".join(base_rules + dynamic_rules + ["Here is Study material:", text])
     return prompt
 
 
@@ -701,18 +697,8 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
 
     result = call_ollama(
         prompt,
-        temperature=0.2,
-        max_tokens=(
-            5200
-            if question_type == "sem_pattern"
-            else 4200
-            if question_type == "mid_pattern"
-            else 1400
-            if question_type == "mcq"
-            else 900
-            if question_type == "fill_blank"
-            else 700
-        ),
+        temperature=0.7,
+        max_tokens=(20000),
         response_schema=QUESTION_RESPONSE_SCHEMA,
     )
     print(f"DEBUG: Ollama result: {result}");
@@ -877,6 +863,7 @@ async def generate_question_bank(
     question_type: str = Form("quiz"),
     filename: str | None = Form(None),
 ) -> dict[str, Any]:
+    print(f"DEBUG: Received request with difficulty={difficulty}, question_type={question_type}, filename={filename}, file={file.filename if file else 'None'}")
     if file is not None:
         file_content = await file.read()
         document_id = hashlib.sha256(file_content).hexdigest()
