@@ -137,7 +137,7 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <h1>Quiz Question Bank Generator</h1>
+        <h2>Quiz Question Bank Generator</h2>
       </header>
 
       <main className="container">

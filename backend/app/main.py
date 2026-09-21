@@ -215,9 +215,9 @@ def is_non_question_content(sentence: str) -> bool:
     ))
 
 
-def filter_generation_source(text: str) -> str:
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
-    return " ".join(sentence.strip() for sentence in sentences if sentence.strip() and not is_non_question_content(sentence))
+# def filter_generation_source(text: str) -> str:
+#     sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+#     return " ".join(sentence.strip() for sentence in sentences if sentence.strip() and not is_non_question_content(sentence))
 
 
 def generate_questions(text: str, difficulty: str = "Medium", question_type: str = "quiz") -> list[dict[str, Any]]:
@@ -405,15 +405,33 @@ QUESTION_RESPONSE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "question": {"type": "string"},
-                    "topic": {"type": "string"},
-                    "unit": {"type": "string"},
-                    "format": {"type": "string", "enum": ["quiz", "fill_blank", "mcq"]},
-                    "section": {"type": "string"},
-                    "marks": {"type": "integer"},
-                    "options": {"type": "array", "items": {"type": "string"}},
-                    "answer": {"type": "string"},
                 },
-                "required": ["question", "topic", "unit", "format", "section", "marks"],
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["questions"],
+    "additionalProperties": False,
+}
+
+QUESTION_RESPONSE_SCHEMA_BACKUP = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    # "topic": {"type": "string"},
+                    # "unit": {"type": "string"},
+                    # "format": {"type": "string", "enum": ["quiz", "fill_blank", "mcq"]},
+                    # "section": {"type": "string"},
+                    # "marks": {"type": "integer"},
+                    # "options": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["question"],
                 "additionalProperties": False,
             },
         },
@@ -527,16 +545,8 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
     """Create a compact prompt tuned to the selected question generation mode."""
     base_rules = [
         "You are an academic question generator. Use ONLY the supplied study material.",
-        "Do not use outside knowledge. Do not invent facts. Keep every question grounded in the source.",
-        "Do not mention course titles, unit titles, or generic phrases such as 'Theory in General'.",
-        "Do not ask questions about the course title, course name, course overview, course objectives, course outcomes, learning objectives, or learning outcomes.",
-        "Do not ask questions about textbooks, text books, reference books, bibliography, references, or suggested readings.",
-        "Keep each question under 220 characters.",
-        "Return concise JSON without markdown or extra explanation.",
         "Difficulty: " + difficulty,
-        "Requested format: " + question_type,
-        "Return ONLY valid JSON in this exact shape:",
-        '{"questions": [{"question": "...", "topic": "...", "unit": "...", "format": "quiz|fill_blank|mcq", "section": "...", "marks": 1, "options": [], "answer": "..."}]}',
+        "Do not generate answers, return only questions."
     ]
 
     if question_type == "quiz":
@@ -575,13 +585,9 @@ def build_question_generation_prompt(text: str, difficulty: str, question_type: 
         ]
     elif question_type == "sem_pattern":
         dynamic_rules = [
-            "Reproduce this exact semester-examination pattern: Section A contains exactly 5 short-answer questions worth 2 marks each; Section B contains exactly 5 descriptive questions worth 8 marks each.",
-            "Both sections use the instruction 'Answer all questions'. Section A marks are '2 x 5 = 10 marks' and Section B marks are '5 x 8 = 40 marks'.",
-            "Return exactly 10 questions: question numbers 1-5 in Section A and 6-10 in Section B.",
-            "Format must be quiz-style only, without MCQ or fill_blank variants.",
-            "Return questions only. Do not include answer keys, answers, explanations, or source answers.",
-            "Use the supplied sentences directly to form questions. Do not use What, Why, When, Where, or How openings.",
-            "Section A questions 1-5 should test concise concepts. Section B questions 6-10 should use the same direct sentence-based format while testing deeper explanation, illustration, comparison, process, charting, or application.",
+            "Generate 5 short answer questions and 5 long answer questions",
+            "Return ONLY valid JSON in this exact shape:",
+            '{"questions": [{"question": "..."]}',
         ]
     elif question_type == "all_mix":
         dynamic_rules = [
@@ -689,9 +695,9 @@ def fallback_mcq_options(question: str, text: str) -> list[str] | None:
 def generate_questions_with_ollama(text: str, difficulty: str, question_type: str) -> list[dict[str, Any]] | None:
     """Ask Ollama for grounded questions; return None when the service fails."""
     # Keep the prompt within the local model's context window for large uploads.
-    generation_text = filter_generation_source(text)
-    generation_text = generation_text[:6000 if question_type in EXAM_PATTERNS else 7000]
-    prompt = build_question_generation_prompt(generation_text, difficulty, question_type)
+    # generation_text = filter_generation_source(text)
+    # generation_text = generation_text[:6000 if question_type in EXAM_PATTERNS else 7000]
+    prompt = build_question_generation_prompt(text, difficulty, question_type)
 
     result = call_ollama(
         prompt,
@@ -709,6 +715,7 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
         ),
         response_schema=QUESTION_RESPONSE_SCHEMA,
     )
+    print(f"DEBUG: Ollama result: {result}");
     generated = result.get("questions") if result else None
     if not isinstance(generated, list) or not generated:
         return None
@@ -724,64 +731,39 @@ def generate_questions_with_ollama(text: str, difficulty: str, question_type: st
         item["question_number"] = index
         item["difficulty"] = difficulty
         item["question_type"] = question_type
-        item.setdefault("topic", "Study material")
-        item.setdefault("unit", "General")
-        item.setdefault("section", "General")
-        item.setdefault("marks", 2)
+        # item.setdefault("topic", "Study material")
+        # item.setdefault("unit", "General")
+        # item.setdefault("section", "General")
+        # item.setdefault("marks", 2)
 
         item["format"] = normalize_question_format(question_type, item)
 
-        if item["format"] == "fill_blank":
-            item["question"] = normalize_fill_blank_question(str(item["question"]))
-            item.pop("options", None)
-        elif item["format"] == "quiz":
-            item.pop("options", None)
-            item.pop("answer", None)
-            item.pop("source_answer", None)
-        elif item["format"] == "mcq":
+        if item["format"] == "mcq":
             options = normalize_mcq_options(str(item["question"]), item.get("options"))
-            if options is None:
-                options = fallback_mcq_options(str(item["question"]), generation_text)
-            if options is None:
-                continue
             item["options"] = options
         elif question_type == "all_mix":
             if item.get("format") != "mcq":
                 item.pop("options", None)
 
-        if question_type == "sem_pattern":
-            question_text = str(item["question"]).strip()
-            if re.search(r"explain in detail the concept described in this statement|can this concept be understood in detail|does this sentence describe", question_text, re.IGNORECASE) or re.match(r"^(what|why|when|where|how)\b", question_text, re.IGNORECASE):
-                item["question"] = f"Describe the concept in this sentence and discuss its key points: {question_text.rstrip('?')}"
-
         questions.append(item)
 
-    if not questions:
-        return None
+    # if question_type == "all_mix":
+    #     by_format = {format_name: [item for item in questions if item.get("format") == format_name] for format_name in ("mcq", "fill_blank", "quiz")}
+    #     if any(len(items) != 1 for items in by_format.values()):
+    #         return None
+    #     questions = [by_format[format_name][0] for format_name in ("mcq", "fill_blank", "quiz")]
 
-    if question_type == "all_mix":
-        by_format = {format_name: [item for item in questions if item.get("format") == format_name] for format_name in ("mcq", "fill_blank", "quiz")}
-        if any(len(items) != 1 for items in by_format.values()):
-            return None
-        questions = [by_format[format_name][0] for format_name in ("mcq", "fill_blank", "quiz")]
-        if not re.match(r"^(what|why|when|where|how)\b", questions[2]["question"].strip(), re.IGNORECASE):
-            questions[2]["question"] = f"What is the main concept described here: {questions[2]['question']}"
+    # if question_type in EXAM_PATTERNS:
+    #     questions = normalize_exam_pattern(question_type, questions)
+    #     if not questions:
+    #         return None
 
-    if question_type in EXAM_PATTERNS:
-        questions = normalize_exam_pattern(question_type, questions)
-        if not questions:
-            return None
-
-    if question_type in {"quiz", "fill_blank", "mcq"}:
-        if any(item.get("format") != question_type for item in questions):
-            return None
-    elif question_type in {"mid_pattern", "sem_pattern"}:
-        if any(item.get("format") != "quiz" for item in questions):
-            return None
-
-    for item in questions:
-        item.pop("answer", None)
-        item.pop("source_answer", None)
+    # if question_type in {"quiz", "fill_blank", "mcq"}:
+    #     if any(item.get("format") != question_type for item in questions):
+    #         return None
+    # elif question_type in {"mid_pattern", "sem_pattern"}:
+    #     if any(item.get("format") != "quiz" for item in questions):
+    #         return None
 
     return questions
 
@@ -897,19 +879,12 @@ async def generate_question_bank(
 ) -> dict[str, Any]:
     if file is not None:
         file_content = await file.read()
-        upload_filename = file.filename or "uploaded-document"
         document_id = hashlib.sha256(file_content).hexdigest()
         document = get_document(document_id)
         if document is None:
             text = extract_text_from_content(file.filename or "", file_content)
             save_document(document_id, file.filename or "uploaded-document", text)
             document = get_document(document_id)
-        text = document["content"]
-    elif filename:
-        document = get_document_by_filename(filename)
-        if document is None:
-            raise HTTPException(status_code=404, detail="Stored filename was not found. Upload the document first.")
-        document_id = document["document_id"]
         text = document["content"]
     else:
         raise HTTPException(status_code=400, detail="Upload a document or provide a stored filename.")
@@ -920,14 +895,7 @@ async def generate_question_bank(
     if not context:
         context = text
 
-    questions = get_cached_questions(document_id, difficulty, question_type)
-    cached = questions is not None
-    if not cached:
-        questions = generate_questions_with_ollama(context or text, difficulty, question_type)
-        if not questions:
-            questions = generate_questions(text, difficulty, question_type)
-        if questions:
-            save_cached_questions(document_id, difficulty, question_type, questions)
+    questions = generate_questions_with_ollama(context or text, difficulty, question_type)
     if not questions:
         raise HTTPException(
             status_code=503,
@@ -941,7 +909,7 @@ async def generate_question_bank(
     return {
         "questions": public_questions,
         "count": len(public_questions),
-        "cached": cached,
+        "cached": "cached" ,
         "context_cached": bool(context),
         "filename": document["filename"] if file is not None else normalize_document_filename(filename or ""),
     }
